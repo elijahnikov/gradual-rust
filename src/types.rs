@@ -157,6 +157,53 @@ pub struct Reason {
     pub error_code: Option<String>,
 }
 
+impl Serialize for Reason {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("type", &self.reason_type)?;
+        match self.reason_type.as_str() {
+            "rule_match" => {
+                if let Some(ref id) = self.rule_id {
+                    map.serialize_entry("ruleId", id)?;
+                }
+                if let Some(ref name) = self.rule_name {
+                    map.serialize_entry("ruleName", name)?;
+                }
+            }
+            "percentage_rollout" => {
+                if let Some(p) = self.percentage {
+                    map.serialize_entry("percentage", &p)?;
+                }
+                if let Some(b) = self.bucket {
+                    map.serialize_entry("bucket", &b)?;
+                }
+            }
+            "gradual_rollout" => {
+                if let Some(si) = self.step_index {
+                    map.serialize_entry("stepIndex", &si)?;
+                }
+                if let Some(p) = self.percentage {
+                    map.serialize_entry("percentage", &p)?;
+                }
+                if let Some(b) = self.bucket {
+                    map.serialize_entry("bucket", &b)?;
+                }
+            }
+            "error" => {
+                if let Some(ref d) = self.detail {
+                    map.serialize_entry("detail", d)?;
+                }
+                if let Some(ref ec) = self.error_code {
+                    map.serialize_entry("errorCode", ec)?;
+                }
+            }
+            _ => {}
+        }
+        map.end()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EvalOutput {
     pub value: serde_json::Value,
