@@ -138,7 +138,7 @@ pub struct EnvironmentSnapshotMeta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnvironmentSnapshot {
-    pub version: i32,
+    pub version: i64,
     pub generated_at: String,
     pub meta: EnvironmentSnapshotMeta,
     pub flags: HashMap<String, SnapshotFlag>,
