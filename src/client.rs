@@ -5,6 +5,8 @@ use serde::Deserialize;
 use tokio::sync::{Mutex, RwLock, Notify};
 use tokio::time::{interval, Duration};
 use tokio::sync::mpsc;
+use futures_util::StreamExt;
+use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 
 use crate::evaluator::evaluate_flag;
 use crate::event_buffer::{EventBuffer, EventBufferOptions, EventMeta};
@@ -22,6 +24,23 @@ pub struct GradualOptions {
     pub events_enabled: bool,
     pub events_flush_ms: Option<u64>,
     pub events_max_batch: Option<usize>,
+    pub realtime_enabled: bool,
+}
+
+impl Default for GradualOptions {
+    fn default() -> Self {
+        GradualOptions {
+            api_key: String::new(),
+            environment: String::new(),
+            base_url: None,
+            polling_enabled: true,
+            polling_interval_ms: None,
+            events_enabled: false,
+            events_flush_ms: None,
+            events_max_batch: None,
+            realtime_enabled: true,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -55,6 +74,8 @@ struct ClientInner {
     events_enabled: bool,
     events_flush_ms: u64,
     events_max_batch: usize,
+    realtime_enabled: bool,
+    ws_close_tx: Mutex<Option<mpsc::Sender<()>>>,
 }
 
 impl GradualClient {
@@ -84,6 +105,8 @@ impl GradualClient {
             events_enabled: opts.events_enabled,
             events_flush_ms: opts.events_flush_ms.unwrap_or(30_000),
             events_max_batch: opts.events_max_batch.unwrap_or(100),
+            realtime_enabled: opts.realtime_enabled,
+            ws_close_tx: Mutex::new(None),
         });
 
         let (stop_tx, stop_rx) = mpsc::channel::<()>(1);
@@ -175,9 +198,18 @@ impl GradualClient {
         listeners.len() - 1
     }
 
-    /// Stop polling and flush pending events.
+    /// Stop polling, close WebSocket, and flush pending events.
     pub async fn close(self) {
         let _ = self.stop_tx.send(()).await;
+
+        // Close WebSocket if active
+        {
+            let mut ws_tx = self.inner.ws_close_tx.lock().await;
+            if let Some(tx) = ws_tx.take() {
+                let _ = tx.send(()).await;
+            }
+        }
+
         let mut eb = self.inner.event_buffer.lock().await;
         if let Some(buffer) = eb.take() {
             buffer.destroy().await;
@@ -220,6 +252,151 @@ impl GradualClient {
         }
 
         merged
+    }
+}
+
+/// Build the WebSocket URL from the base HTTP URL.
+fn build_ws_url(base_url: &str, api_key: &str, environment: &str) -> String {
+    let ws_base = base_url
+        .replace("https://", "wss://")
+        .replace("http://", "ws://");
+
+    let encoded_api_key = urlencoding::encode(api_key);
+    let encoded_env = urlencoding::encode(environment);
+
+    format!(
+        "{}/sdk/connect?apiKey={}&environment={}",
+        ws_base, encoded_api_key, encoded_env
+    )
+}
+
+/// Attempt to connect via WebSocket and receive the initial snapshot.
+/// Returns true if the initial snapshot was successfully received and stored.
+async fn try_ws_init(inner: &Arc<ClientInner>) -> bool {
+    let url = build_ws_url(&inner.base_url, &inner.api_key, &inner.environment);
+
+    let connect_result = tokio_tungstenite::connect_async(&url).await;
+    let (ws_stream, _response) = match connect_result {
+        Ok(pair) => pair,
+        Err(_) => return false,
+    };
+
+    let (_write, mut read) = ws_stream.split();
+
+    // Wait for the first message (initial snapshot)
+    let first_msg = match read.next().await {
+        Some(Ok(msg)) => msg,
+        _ => return false,
+    };
+
+    let text = match first_msg {
+        WsMessage::Text(t) => t.to_string(),
+        _ => return false,
+    };
+
+    let snap: EnvironmentSnapshot = match serde_json::from_str(&text) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    {
+        let mut snapshot = inner.snapshot.write().await;
+        *snapshot = Some(snap);
+    }
+
+    // Store the close channel
+    let (ws_close_tx, ws_close_rx) = mpsc::channel::<()>(1);
+    {
+        let mut close_tx = inner.ws_close_tx.lock().await;
+        *close_tx = Some(ws_close_tx);
+    }
+
+    // Spawn the background WebSocket listener task
+    let inner_clone = Arc::clone(inner);
+    tokio::spawn(async move {
+        ws_run(inner_clone, read, ws_close_rx).await;
+    });
+
+    true
+}
+
+type WsRead = futures_util::stream::SplitStream<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+>;
+
+/// Listen on a WebSocket read stream, handling reconnection with exponential backoff.
+async fn ws_run(
+    inner: Arc<ClientInner>,
+    mut read: WsRead,
+    mut close_rx: mpsc::Receiver<()>,
+) {
+    loop {
+        // Listen for messages on the current connection
+        let needs_reconnect = loop {
+            tokio::select! {
+                msg = read.next() => {
+                    match msg {
+                        Some(Ok(WsMessage::Text(text))) => {
+                            handle_ws_snapshot(&inner, &text).await;
+                        }
+                        Some(Ok(WsMessage::Close(_))) | None | Some(Err(_)) => {
+                            break true;
+                        }
+                        _ => {} // Ping/Pong/Binary — ignore
+                    }
+                }
+                _ = close_rx.recv() => {
+                    return; // Client closing
+                }
+            }
+        };
+
+        if !needs_reconnect {
+            return;
+        }
+
+        // Reconnect with exponential backoff
+        let mut backoff_secs: u64 = 1;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
+                _ = close_rx.recv() => { return; }
+            }
+
+            let url = build_ws_url(&inner.base_url, &inner.api_key, &inner.environment);
+            if let Ok((ws_stream, _)) = tokio_tungstenite::connect_async(&url).await {
+                let (_write, mut new_read) = ws_stream.split();
+
+                // Read initial snapshot on reconnect
+                if let Some(Ok(WsMessage::Text(text))) = new_read.next().await {
+                    handle_ws_snapshot(&inner, &text).await;
+                    read = new_read;
+                    break; // Back to the listen loop
+                }
+            }
+
+            backoff_secs = (backoff_secs * 2).min(30);
+        }
+    }
+}
+
+async fn handle_ws_snapshot(inner: &ClientInner, text: &str) {
+    if let Ok(snap) = serde_json::from_str::<EnvironmentSnapshot>(text) {
+        let prev_version = {
+            let s = inner.snapshot.read().await;
+            s.as_ref().map(|s| s.version).unwrap_or(0)
+        };
+        let new_version = snap.version;
+        {
+            let mut snapshot = inner.snapshot.write().await;
+            *snapshot = Some(snap);
+        }
+        if new_version != prev_version {
+            let listeners = inner.update_listeners.lock().await;
+            for cb in listeners.iter() {
+                cb();
+            }
+        }
     }
 }
 
@@ -269,12 +446,21 @@ async fn init(inner: Arc<ClientInner>, mut stop_rx: mpsc::Receiver<()>) {
         }
     }
 
-    // Fetch initial snapshot
-    if let Err(e) = fetch_snapshot(&inner).await {
-        let mut err = inner.init_err.write().await;
-        *err = Some(format!("gradual: snapshot fetch failed: {}", e));
-        inner.ready.notify_waiters();
-        return;
+    // Try WebSocket first if realtime is enabled
+    let ws_connected = if inner.realtime_enabled {
+        try_ws_init(&inner).await
+    } else {
+        false
+    };
+
+    // If WebSocket didn't work (or not enabled), fall back to fetch snapshot
+    if !ws_connected {
+        if let Err(e) = fetch_snapshot(&inner).await {
+            let mut err = inner.init_err.write().await;
+            *err = Some(format!("gradual: snapshot fetch failed: {}", e));
+            inner.ready.notify_waiters();
+            return;
+        }
     }
 
     // Initialize event buffer
@@ -301,7 +487,13 @@ async fn init(inner: Arc<ClientInner>, mut stop_rx: mpsc::Receiver<()>) {
     // Signal ready
     inner.ready.notify_waiters();
 
-    // Start polling if enabled
+    // If WebSocket is connected, no need for polling — just wait for stop signal
+    if ws_connected {
+        let _ = stop_rx.recv().await;
+        return;
+    }
+
+    // Start polling if enabled (fallback when WebSocket is not active)
     if inner.polling_enabled {
         let mut tick = interval(inner.polling_interval);
         loop {
